@@ -98,8 +98,8 @@ class DocLoader:
                             module_id,
                             data.get('source', ''),
                             data['text'],
-                            embedding,  # Убедитесь, что это список из 384 элементов
-                            data['id']  # chunk_id
+                            embedding,  
+                            data['id']  
                         ))
                         loaded_count += 1
                         
@@ -142,7 +142,7 @@ class DocLoader:
             self.conn.close()
             logging.info("Соединение с БД закрыто")
 
-# Пример использования
+
 if __name__ == "__main__":
     # Параметры подключения
     db_params = {

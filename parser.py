@@ -3,6 +3,7 @@ import psycopg2
 from pgvector.psycopg2 import register_vector
 import logging
 import sys
+import os
 import numpy as np
 
 # Настройка логирования
@@ -30,9 +31,10 @@ class DocLoader:
             raise
 
     def get_or_create_module(self, module_name, module_label):
-        """Создает или получает ID модуля"""
+        """Создает или получает ID модуля с учётом новой структуры таблицы"""
         with self.conn.cursor() as cur:
             try:
+                # Ищем по имени модуля (как в БД)
                 cur.execute("SELECT id FROM modules WHERE name = %s", (module_name,))
                 module = cur.fetchone()
                 
@@ -40,12 +42,15 @@ class DocLoader:
                     logging.info(f"Модуль {module_name} найден, ID: {module[0]}")
                     return module[0]
                 
-                # Создаем вектор из 384 нулей
-                default_embedding = [0.0] * 384
+                # Создаем новый модуль с минимально необходимыми полями
                 cur.execute("""
                     INSERT INTO modules (
-                        id, name, label, description, 
-                        auth_type, categories, embedding
+                        id, 
+                        name, 
+                        label, 
+                        description,
+                        auth_type,
+                        is_public
                     )
                     VALUES (
                         gen_random_uuid(),
@@ -53,11 +58,10 @@ class DocLoader:
                         %s,
                         'Автоматически создан при импорте документации',
                         'OAUTH2',
-                        ARRAY['default'],
-                        %s::vector(384)
+                        TRUE
                     )
                     RETURNING id
-                """, (module_name, module_label, default_embedding))
+                """, (module_name, module_label))
                 module_id = cur.fetchone()[0]
                 self.conn.commit()
                 logging.info(f"Создан новый модуль: {module_name}, ID: {module_id}")
@@ -69,22 +73,53 @@ class DocLoader:
                 raise
 
     def load_docs(self, file_path, module_name, module_label):
-        """Загружает документацию в БД"""
+        """Загружает документацию в БД с обработкой особенностей файлов"""
         try:
+            # Проверка существования файла
+            if not os.path.exists(file_path):
+                logging.error(f"Файл не найден: {file_path}")
+                return 0
+                
             module_id = self.get_or_create_module(module_name, module_label)
             loaded_count = 0
+            skipped_count = 0
+            total_bytes = os.path.getsize(file_path)
+            processed_bytes = 0
             
             with open(file_path, 'r', encoding='utf-8', errors='ignore') as f, self.conn.cursor() as cur:
                 for line in f:
                     try:
+                        processed_bytes += len(line)
+                        # Логирование прогресса каждые 10%
+                        if processed_bytes % max(1, total_bytes // 10) < 100:
+                            progress = processed_bytes / total_bytes * 100
+                            logging.info(f"Прогресс: {progress:.1f}% ({processed_bytes}/{total_bytes} байт)")
+                        
                         data = json.loads(line)
                         embedding = data.get('embedding', [])
-
+                        
+                        # Проверка и нормализация эмбеддинга
+                        if len(embedding) == 0:
+                            skipped_count += 1
+                            continue
+                            
+                        # Конвертация в список float если необходимо
+                        if isinstance(embedding, np.ndarray):
+                            embedding = embedding.tolist()
+                            
                         # Проверка размерности
                         if len(embedding) != 384:
-                            logging.warning(f"Неверная размерность эмбеддинга: {len(embedding)} в чанке {data.get('id', 'unknown')}")
-                            continue
-
+                            logging.warning(
+                                f"Неверная размерность эмбеддинга: {len(embedding)} "
+                                f"в чанке {data.get('id', 'unknown')}. Исправление до 384."
+                            )
+                            # Дополняем или обрезаем до 384 измерений
+                            if len(embedding) < 384:
+                                embedding += [0.0] * (384 - len(embedding))
+                            else:
+                                embedding = embedding[:384]
+                        
+                        # Вставка данных
                         cur.execute("""
                             INSERT INTO api_docs (
                                 module_id, 
@@ -97,15 +132,16 @@ class DocLoader:
                         """, (
                             module_id,
                             data.get('source', ''),
-                            data['text'],
-                            embedding,  
-                            data['id']  
+                            data.get('text', ''),
+                            embedding,
+                            data.get('id', '')
                         ))
                         loaded_count += 1
                         
-                        # Логирование прогресса
+                        # Пакетный коммит каждые 100 записей
                         if loaded_count % 100 == 0:
-                            logging.info(f"Обработано {loaded_count} документов")
+                            self.conn.commit()
+                            logging.info(f"Загружено {loaded_count} документов")
                             
                     except json.JSONDecodeError:
                         logging.warning(f"Ошибка декодирования JSON в строке: {line[:100]}...")
@@ -114,23 +150,12 @@ class DocLoader:
                     except Exception as e:
                         logging.warning(f"Ошибка обработки строки: {e}")
                 
-                # Обновляем эмбеддинг модуля
-                cur.execute("""
-                    UPDATE modules
-                    SET embedding = COALESCE(
-                        (SELECT AVG(embedding) FROM api_docs WHERE module_id = %s),
-                        %s::vector(384)
-                    )
-                    WHERE id = %s
-                """, (module_id, [0.0] * 384, module_id))
-                
                 self.conn.commit()
                 logging.info(f"Загружено документов: {loaded_count} для модуля {module_name}")
+                if skipped_count > 0:
+                    logging.warning(f"Пропущено {skipped_count} записей с пустыми эмбеддингами")
                 return loaded_count
                 
-        except FileNotFoundError:
-            logging.error(f"Файл не найден: {file_path}")
-            return 0
         except Exception as e:
             logging.error(f"Критическая ошибка при загрузке {file_path}: {e}")
             self.conn.rollback()
@@ -150,30 +175,34 @@ if __name__ == "__main__":
         "user": "postgres",
         "password": "postgres_ai_agent",
         "host": "82.202.142.56",
-        "port": 5480  # Порт как число
+        "port": 5480
+    }
+    
+    # Соответствие файлов и имен модулей в БД
+    MODULE_MAPPING = {
+        "embeddings_yandex_tracker.jsonl": ("YandexTracker", "Яндекс Трекер"),
+        "embeddings_google_drive.jsonl": ("google_drive", "Google Drive"),
+        "embeddings_Bitrix24.jsonl": ("bitrix", "Bitrix24")
     }
     
     loader = None
     try:
         loader = DocLoader(db_params)
         
-        # Загрузка Яндекс.Трекера
-        result = loader.load_docs(
-            "embeddings/embeddings_yandex_tracker.jsonl",
-            "yandex_tracker",
-            "Яндекс Трекер"
-        )
-        if not result:
-            logging.error("Не удалось загрузить документы для Яндекс.Трекера")
-        
-        # Загрузка Google Drive
-        result = loader.load_docs(
-            "embeddings/embeddings_google_drive.jsonl",
-            "google_drive",
-            "Google Drive"
-        )
-        if not result:
-            logging.error("Не удалось загрузить документы для Google Drive")
+        # Обработка всех файлов в папке embeddings
+        embeddings_dir = "embeddings"
+        for filename in os.listdir(embeddings_dir):
+            if filename.endswith(".jsonl") and filename in MODULE_MAPPING:
+                file_path = os.path.join(embeddings_dir, filename)
+                module_name, module_label = MODULE_MAPPING[filename]
+                
+                logging.info(f"Начало загрузки: {filename} → {module_name}")
+                result = loader.load_docs(file_path, module_name, module_label)
+                
+                if result > 0:
+                    logging.info(f"Успешно загружено {result} документов для {module_name}")
+                else:
+                    logging.error(f"Не удалось загрузить документы для {module_name}")
         
     except ConnectionError:
         logging.critical("Не удалось установить соединение с БД. Проверьте параметры подключения.")
